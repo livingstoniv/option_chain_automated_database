@@ -4,15 +4,47 @@ import sqlite3
 import json
 import datetime
 import time
+import math
+from scipy.stats import norm
 
 
+# Black-Scholes Model to calculate Greeks
+def black_scholes_greeks(S, K, T, r, sigma, option_type='call'):
+    # S = Current price of the underlying asset
+    # K = Strike price of the option
+    # T = Time to expiration in years
+    # r = Risk-free rate (annualized)
+    # sigma = Volatility of the underlying asset
+    # option_type = 'call' or 'put'
+    
+    # Calculate d1 and d2 for the Black-Scholes model
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    
+    # Greeks calculations
+    if option_type == 'call':
+        delta = norm.cdf(d1)
+        gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
+        theta = (-S * norm.pdf(d1) * sigma / (2 * math.sqrt(T))) - (r * K * math.exp(-r * T) * norm.cdf(d2))
+        vega = S * norm.pdf(d1) * math.sqrt(T)
+        rho = K * T * math.exp(-r * T) * norm.cdf(d2)
+    elif option_type == 'put':
+        delta = norm.cdf(d1) - 1
+        gamma = norm.pdf(d1) / (S * sigma * math.sqrt(T))
+        theta = (-S * norm.pdf(d1) * sigma / (2 * math.sqrt(T))) + (r * K * math.exp(-r * T) * norm.cdf(-d2))
+        vega = S * norm.pdf(d1) * math.sqrt(T)
+        rho = -K * T * math.exp(-r * T) * norm.cdf(-d2)
+    
+    return delta, gamma, theta, vega, rho
+
+
+# Load tickers from the JSON file
 def load_tickers_from_json(file_path):
     with open(file_path, 'r') as file:
         data = json.load(file)
-
-        # Iterate through all the entries (keys are like "0", "1", "2", etc.)
         tickers = [data[key]['ticker'] for key in data]
         return tickers
+
 
 def get_option_data():
     # Load tickers from the JSON file
@@ -47,10 +79,21 @@ def get_option_data():
                     volume INTEGER,
                     openInterest INTEGER,
                     impliedVolatility REAL,
+                    delta REAL,
+                    gamma REAL,
+                    theta REAL,
+                    vega REAL,
+                    rho REAL,
                     timestamp TEXT,
                     PRIMARY KEY (contractSymbol, timestamp)
                 )
             ''')
+
+            # Get the current price of the underlying asset (S)
+            S = ticker.history(period="1d")['Close'].iloc[0]  # Latest closing price
+
+            # Risk-free rate (you can use a fixed value or fetch from an external source)
+            r = 0.05  # Example: 5% risk-free rate
 
             # Loop through all expiration dates and fetch options data
             for date in expiration_dates:
@@ -60,7 +103,7 @@ def get_option_data():
                 calls = option_chain.calls.copy()
                 puts = option_chain.puts.copy()
 
-                # Add a column to indicate whether it's a 'call' or 'put'
+                # Add a column to indicate whether it's 'call' or 'put'
                 calls["type"] = "call"
                 puts["type"] = "put"
 
@@ -73,16 +116,42 @@ def get_option_data():
                 calls["timestamp"] = timestamp
                 puts["timestamp"] = timestamp
 
+                # Calculate Greeks for calls and puts
+                for idx, row in calls.iterrows():
+                    # Time to expiration (T) in years
+                    T = (datetime.datetime.strptime(date, "%Y-%m-%d") - datetime.datetime.now()).days / 365.0
+                    sigma = row['impliedVolatility']  # Implied volatility
+                    delta, gamma, theta, vega, rho = black_scholes_greeks(S, row['strike'], T, r, sigma, option_type='call')
+                    
+                    # Insert Greeks into the DataFrame
+                    calls.at[idx, 'delta'] = delta
+                    calls.at[idx, 'gamma'] = gamma
+                    calls.at[idx, 'theta'] = theta
+                    calls.at[idx, 'vega'] = vega
+                    calls.at[idx, 'rho'] = rho
+
+                for idx, row in puts.iterrows():
+                    # Time to expiration (T) in years
+                    T = (datetime.datetime.strptime(date, "%Y-%m-%d") - datetime.datetime.now()).days / 365.0
+                    sigma = row['impliedVolatility']  # Implied volatility
+                    delta, gamma, theta, vega, rho = black_scholes_greeks(S, row['strike'], T, r, sigma, option_type='put')
+                    
+                    # Insert Greeks into the DataFrame
+                    puts.at[idx, 'delta'] = delta
+                    puts.at[idx, 'gamma'] = gamma
+                    puts.at[idx, 'theta'] = theta
+                    puts.at[idx, 'vega'] = vega
+                    puts.at[idx, 'rho'] = rho
+
                 # Keep only the required columns to match SQL schema
-                calls = calls[["contractSymbol", "type", "expiration_date", "strike", "lastPrice", "bid", "ask", "volume", "openInterest", "impliedVolatility", "timestamp"]]
-                puts = puts[["contractSymbol", "type", "expiration_date", "strike", "lastPrice", "bid", "ask", "volume", "openInterest", "impliedVolatility", "timestamp"]]
+                calls = calls[["contractSymbol", "type", "expiration_date", "strike", "lastPrice", "bid", "ask", "volume", "openInterest", "impliedVolatility", "delta", "gamma", "theta", "vega", "rho", "timestamp"]]
+                puts = puts[["contractSymbol", "type", "expiration_date", "strike", "lastPrice", "bid", "ask", "volume", "openInterest", "impliedVolatility", "delta", "gamma", "theta", "vega", "rho", "timestamp"]]
 
                 # Insert data into the SQLite database for both calls and puts
-                # Use `if_exists="append"` to add new rows but not overwrite existing data
                 calls.to_sql(f"{ticker_symbol}_options", conn, if_exists="append", index=False)
                 puts.to_sql(f"{ticker_symbol}_options", conn, if_exists="append", index=False)
 
-                print(f"Saved options data for {ticker_symbol} on {date}.")
+                print(f"Saved options data with Greeks for {ticker_symbol} on {date}.")
 
                 # Sleep for 1 second between each ticker's option chain data retrieval
                 time.sleep(1)
